@@ -1175,6 +1175,12 @@ KJ_TEST("HttpClient chunked body pump from fixed length stream") {
     kj::StringPtr responseText = "HTTP/1.1 204 No Content\r\n\r\n";
     pipe.ends[1]->write(responseText.begin(), responseText.size()).wait(waitScope);
     auto response = req.response.wait(waitScope);
+
+    // Wait even harder, because the coroutine conversion implicitly eagerly-evaluates stuff, which
+    // I guess makes the response complete before the damn terminal chunk now.
+    //
+    // TODO(2.0): req.body->end() should fix this, right?
+    evalLater([]() {}).wait(waitScope);
   }
 
   pipe.ends[0]->shutdownWrite();

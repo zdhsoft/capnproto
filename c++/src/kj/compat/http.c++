@@ -1255,60 +1255,49 @@ public:
   // public interface
 
   kj::Promise<Request> readRequest() override {
-    return readRequestHeaders()
-        .then([this](HttpHeaders::RequestConnectOrProtocolError&& requestOrProtocolError)
-            -> HttpInputStream::Request {
-      auto request = KJ_REQUIRE_NONNULL(
-          requestOrProtocolError.tryGet<HttpHeaders::Request>(), "bad request");
-      auto body = getEntityBody(HttpInputStreamImpl::REQUEST, request.method, 0, headers);
+    auto requestOrProtocolError = co_await readRequestHeaders();
+    auto request = KJ_REQUIRE_NONNULL(
+        requestOrProtocolError.tryGet<HttpHeaders::Request>(), "bad request");
+    auto body = getEntityBody(HttpInputStreamImpl::REQUEST, request.method, 0, headers);
 
-      return { request.method, request.url, headers, kj::mv(body) };
-    });
+    co_return { request.method, request.url, headers, kj::mv(body) };
   }
 
   kj::Promise<kj::OneOf<Request, Connect>> readRequestAllowingConnect() override {
-    return readRequestHeaders()
-        .then([this](HttpHeaders::RequestConnectOrProtocolError&& requestOrProtocolError)
-            -> kj::OneOf<HttpInputStream::Request, HttpInputStream::Connect> {
-      KJ_SWITCH_ONEOF(requestOrProtocolError) {
-        KJ_CASE_ONEOF(request, HttpHeaders::Request) {
-          auto body = getEntityBody(HttpInputStreamImpl::REQUEST, request.method, 0, headers);
-          return HttpInputStream::Request { request.method, request.url, headers, kj::mv(body) };
-        }
-        KJ_CASE_ONEOF(request, HttpHeaders::ConnectRequest) {
-          auto body = getEntityBody(HttpInputStreamImpl::REQUEST, HttpConnectMethod(), 0, headers);
-          return HttpInputStream::Connect { request.authority, headers, kj::mv(body) };
-        }
-        KJ_CASE_ONEOF(error, HttpHeaders::ProtocolError) {
-          KJ_FAIL_REQUIRE("bad request");
-        }
+    auto requestOrProtocolError = co_await readRequestHeaders();
+    KJ_SWITCH_ONEOF(requestOrProtocolError) {
+      KJ_CASE_ONEOF(request, HttpHeaders::Request) {
+        auto body = getEntityBody(HttpInputStreamImpl::REQUEST, request.method, 0, headers);
+        co_return HttpInputStream::Request { request.method, request.url, headers, kj::mv(body) };
       }
-      KJ_UNREACHABLE;
-    });
+      KJ_CASE_ONEOF(request, HttpHeaders::ConnectRequest) {
+        auto body = getEntityBody(HttpInputStreamImpl::REQUEST, HttpConnectMethod(), 0, headers);
+        co_return HttpInputStream::Connect { request.authority, headers, kj::mv(body) };
+      }
+      KJ_CASE_ONEOF(error, HttpHeaders::ProtocolError) {
+        KJ_FAIL_REQUIRE("bad request");
+      }
+    }
+    KJ_UNREACHABLE;
   }
 
   kj::Promise<Response> readResponse(HttpMethod requestMethod) override {
-    return readResponseHeaders()
-        .then([this,requestMethod](HttpHeaders::ResponseOrProtocolError&& responseOrProtocolError)
-              -> HttpInputStream::Response {
-      auto response = KJ_REQUIRE_NONNULL(
-          responseOrProtocolError.tryGet<HttpHeaders::Response>(), "bad response");
-      auto body = getEntityBody(HttpInputStreamImpl::RESPONSE, requestMethod,
-                                response.statusCode, headers);
+    auto responseOrProtocolError = co_await readResponseHeaders();
+    auto response = KJ_REQUIRE_NONNULL(
+        responseOrProtocolError.tryGet<HttpHeaders::Response>(), "bad response");
+    auto body = getEntityBody(HttpInputStreamImpl::RESPONSE, requestMethod,
+                              response.statusCode, headers);
 
-      return { response.statusCode, response.statusText, headers, kj::mv(body) };
-    });
+    co_return { response.statusCode, response.statusText, headers, kj::mv(body) };
   }
 
   kj::Promise<Message> readMessage() override {
-    return readMessageHeaders()
-        .then([this](kj::ArrayPtr<char> text) -> HttpInputStream::Message {
-      headers.clear();
-      KJ_REQUIRE(headers.tryParse(text), "bad message");
-      auto body = getEntityBody(HttpInputStreamImpl::RESPONSE, HttpMethod::GET, 0, headers);
+    auto text = co_await readMessageHeaders();
+    headers.clear();
+    KJ_REQUIRE(headers.tryParse(text), "bad message");
+    auto body = getEntityBody(HttpInputStreamImpl::RESPONSE, HttpMethod::GET, 0, headers);
 
-      return { headers, kj::mv(body) };
-    });
+    co_return { headers, kj::mv(body) };
   }
 
   // ---------------------------------------------------------------------------
@@ -1345,33 +1334,30 @@ public:
 
     if (resumingRequest != nullptr) {
       // We're resuming a request, so report that we have a message.
-      return true;
+      co_return true;
     }
 
     if (onMessageDone != nullptr) {
       // We're still working on reading the previous body.
       auto fork = messageReadQueue.fork();
       messageReadQueue = fork.addBranch();
-      return fork.addBranch().then([this]() {
-        return awaitNextMessage();
-      });
+      co_await fork.addBranch();
     }
 
-    snarfBufferedLineBreak();
+    for (;;) {
+      snarfBufferedLineBreak();
 
-    if (!lineBreakBeforeNextHeader && leftover != nullptr) {
-      return true;
-    }
-
-    return inner.tryRead(headerBuffer.begin(), 1, headerBuffer.size())
-        .then([this](size_t amount) -> kj::Promise<bool> {
-      if (amount > 0) {
-        leftover = headerBuffer.slice(0, amount);
-        return awaitNextMessage();
-      } else {
-        return false;
+      if (!lineBreakBeforeNextHeader && leftover != nullptr) {
+        co_return true;
       }
-    });
+
+      auto amount = co_await inner.tryRead(headerBuffer.begin(), 1, headerBuffer.size());
+      if (amount == 0) {
+        co_return false;
+      }
+
+      leftover = headerBuffer.slice(0, amount);
+    }
   }
 
   bool isCleanDrain() {
@@ -1385,63 +1371,57 @@ public:
     ++pendingMessageCount;
     auto paf = kj::newPromiseAndFulfiller<void>();
 
-    auto promise = messageReadQueue
-        .then([this,fulfiller=kj::mv(paf.fulfiller)]() mutable {
-      onMessageDone = kj::mv(fulfiller);
-      return readHeader(HeaderType::MESSAGE, 0, 0);
-    });
-
+    auto allowMeToMutateState = kj::mv(messageReadQueue);
     messageReadQueue = kj::mv(paf.promise);
 
-    return promise;
+    co_await allowMeToMutateState;
+    onMessageDone = kj::mv(paf.fulfiller);
+
+    co_return co_await readHeader(HeaderType::MESSAGE, 0, 0);
   }
 
   kj::Promise<uint64_t> readChunkHeader() {
     KJ_REQUIRE(onMessageDone != nullptr);
 
     // We use the portion of the header after the end of message headers.
-    return readHeader(HeaderType::CHUNK, messageHeaderEnd, messageHeaderEnd)
-        .then([](kj::ArrayPtr<char> text) -> uint64_t {
-      KJ_REQUIRE(text.size() > 0) { break; }
+    auto text = co_await readHeader(HeaderType::CHUNK, messageHeaderEnd, messageHeaderEnd);
+    KJ_REQUIRE(text.size() > 0) { break; }
 
-      uint64_t value = 0;
-      for (char c: text) {
-        if ('0' <= c && c <= '9') {
-          value = value * 16 + (c - '0');
-        } else if ('a' <= c && c <= 'f') {
-          value = value * 16 + (c - 'a' + 10);
-        } else if ('A' <= c && c <= 'F') {
-          value = value * 16 + (c - 'A' + 10);
-        } else {
-          KJ_FAIL_REQUIRE("invalid HTTP chunk size", text, text.asBytes()) { break; }
-          return value;
-        }
+    uint64_t value = 0;
+    for (char c: text) {
+      if ('0' <= c && c <= '9') {
+        value = value * 16 + (c - '0');
+      } else if ('a' <= c && c <= 'f') {
+        value = value * 16 + (c - 'a' + 10);
+      } else if ('A' <= c && c <= 'F') {
+        value = value * 16 + (c - 'A' + 10);
+      } else {
+        KJ_FAIL_REQUIRE("invalid HTTP chunk size", text, text.asBytes()) { break; }
+        co_return value;
       }
+    }
 
-      return value;
-    });
+    co_return value;
   }
 
   inline kj::Promise<HttpHeaders::RequestConnectOrProtocolError> readRequestHeaders() {
     KJ_IF_MAYBE(resuming, resumingRequest) {
       KJ_DEFER(resumingRequest = nullptr);
-      return HttpHeaders::RequestConnectOrProtocolError(*resuming);
+      co_return HttpHeaders::RequestConnectOrProtocolError(*resuming);
     }
 
-    return readMessageHeaders().then([this](kj::ArrayPtr<char> text) {
-      headers.clear();
-      return headers.tryParseRequestOrConnect(text);
-    });
+    auto text = co_await readMessageHeaders();
+    headers.clear();
+    co_return headers.tryParseRequestOrConnect(text);
   }
 
   inline kj::Promise<HttpHeaders::ResponseOrProtocolError> readResponseHeaders() {
     // Note: readResponseHeaders() could be called multiple times concurrently when pipelining
     //   requests. readMessageHeaders() will serialize these, but it's important not to mess with
     //   state (like calling headers.clear()) before said serialization has taken place.
-    return readMessageHeaders().then([this](kj::ArrayPtr<char> text) {
-      headers.clear();
-      return headers.tryParseResponse(text);
-    });
+    auto text = co_await readMessageHeaders();
+    headers.clear();
+    co_return headers.tryParseResponse(text);
   }
 
   inline const HttpHeaders& getHeaders() const { return headers; }
@@ -1453,12 +1433,12 @@ public:
 
     if (leftover == nullptr) {
       // No leftovers. Forward directly to inner stream.
-      return inner.tryRead(buffer, minBytes, maxBytes);
+      co_return co_await inner.tryRead(buffer, minBytes, maxBytes);
     } else if (leftover.size() >= maxBytes) {
       // Didn't even read the entire leftover buffer.
       memcpy(buffer, leftover.begin(), maxBytes);
       leftover = leftover.slice(maxBytes, leftover.size());
-      return maxBytes;
+      co_return maxBytes;
     } else {
       // Read the entire leftover buffer, plus some.
       memcpy(buffer, leftover.begin(), leftover.size());
@@ -1466,12 +1446,12 @@ public:
       leftover = nullptr;
       if (copied >= minBytes) {
         // Got enough to stop here.
-        return copied;
+        co_return copied;
       } else {
         // Read the rest from the underlying stream.
-        return inner.tryRead(reinterpret_cast<byte*>(buffer) + copied,
-                             minBytes - copied, maxBytes - copied)
-            .then([copied](size_t n) { return n + copied; });
+        auto n = co_await inner.tryRead(reinterpret_cast<byte*>(buffer) + copied,
+                             minBytes - copied, maxBytes - copied);
+        co_return n + copied;
       }
     }
   }
@@ -1544,66 +1524,67 @@ private:
     // containing the result, and that the input is delimited by newlines rather than by an upfront
     // length.
 
-    kj::Promise<size_t> readPromise = nullptr;
+    for (;;) {
+      kj::Promise<size_t> readPromise = nullptr;
 
-    // Figure out where we're reading from.
-    if (leftover != nullptr) {
-      // Some data is still left over from the previous message, so start with that.
+      // Figure out where we're reading from.
+      if (leftover != nullptr) {
+        // Some data is still left over from the previous message, so start with that.
 
-      // This can only happen if this is the initial call to readHeader() (not recursive).
-      KJ_ASSERT(bufferStart == bufferEnd);
+        // This can only happen if this is the initial run through the loop.
+        KJ_ASSERT(bufferStart == bufferEnd);
 
-      // OK, set bufferStart and bufferEnd to both point to the start of the leftover, and then
-      // fake a read promise as if we read the bytes from the leftover.
-      bufferStart = leftover.begin() - headerBuffer.begin();
-      bufferEnd = bufferStart;
-      readPromise = leftover.size();
-      leftover = nullptr;
-    } else {
-      // Need to read more data from the underlying stream.
+        // OK, set bufferStart and bufferEnd to both point to the start of the leftover, and then
+        // fake a read promise as if we read the bytes from the leftover.
+        bufferStart = leftover.begin() - headerBuffer.begin();
+        bufferEnd = bufferStart;
+        readPromise = leftover.size();
+        leftover = nullptr;
+      } else {
+        // Need to read more data from the underlying stream.
 
-      if (bufferEnd == headerBuffer.size()) {
-        // Out of buffer space.
+        if (bufferEnd == headerBuffer.size()) {
+          // Out of buffer space.
 
-        // Maybe we can move bufferStart backwards to make more space at the end?
-        size_t minStart = type == HeaderType::MESSAGE ? 0 : messageHeaderEnd;
+          // Maybe we can move bufferStart backwards to make more space at the end?
+          size_t minStart = type == HeaderType::MESSAGE ? 0 : messageHeaderEnd;
 
-        if (bufferStart > minStart) {
-          // Move to make space.
-          memmove(headerBuffer.begin() + minStart, headerBuffer.begin() + bufferStart,
-                  bufferEnd - bufferStart);
-          bufferEnd = bufferEnd - bufferStart + minStart;
-          bufferStart = minStart;
-        } else {
-          // Really out of buffer space. Grow the buffer.
-          if (type != HeaderType::MESSAGE) {
-            // Can't grow because we'd invalidate the HTTP headers.
-            return KJ_EXCEPTION(FAILED, "invalid HTTP chunk size");
+          if (bufferStart > minStart) {
+            // Move to make space.
+            memmove(headerBuffer.begin() + minStart, headerBuffer.begin() + bufferStart,
+                    bufferEnd - bufferStart);
+            bufferEnd = bufferEnd - bufferStart + minStart;
+            bufferStart = minStart;
+          } else {
+            // Really out of buffer space. Grow the buffer.
+            if (type != HeaderType::MESSAGE) {
+              // Can't grow because we'd invalidate the HTTP headers.
+              kj::throwFatalException(KJ_EXCEPTION(FAILED, "invalid HTTP chunk size"));
+            }
+            KJ_REQUIRE(headerBuffer.size() < MAX_BUFFER, "request headers too large");
+            auto newBuffer = kj::heapArray<char>(headerBuffer.size() * 2);
+            memcpy(newBuffer.begin(), headerBuffer.begin(), headerBuffer.size());
+            headerBuffer = kj::mv(newBuffer);
           }
-          KJ_REQUIRE(headerBuffer.size() < MAX_BUFFER, "request headers too large");
-          auto newBuffer = kj::heapArray<char>(headerBuffer.size() * 2);
-          memcpy(newBuffer.begin(), headerBuffer.begin(), headerBuffer.size());
-          headerBuffer = kj::mv(newBuffer);
         }
+
+        // How many bytes will we read?
+        size_t maxBytes = headerBuffer.size() - bufferEnd;
+
+        if (type == HeaderType::CHUNK) {
+          // Roughly limit the amount of data we read to MAX_CHUNK_HEADER_SIZE.
+          // TODO(perf): This is mainly to avoid copying a lot of body data into our buffer just to
+          //   copy it again when it is read. But maybe the copy would be cheaper than overhead of
+          //   extra event loop turns?
+          KJ_REQUIRE(bufferEnd - bufferStart <= MAX_CHUNK_HEADER_SIZE, "invalid HTTP chunk size");
+          maxBytes = kj::min(maxBytes, MAX_CHUNK_HEADER_SIZE);
+        }
+
+        readPromise = inner.read(headerBuffer.begin() + bufferEnd, 1, maxBytes);
       }
 
-      // How many bytes will we read?
-      size_t maxBytes = headerBuffer.size() - bufferEnd;
+      auto amount = co_await readPromise;
 
-      if (type == HeaderType::CHUNK) {
-        // Roughly limit the amount of data we read to MAX_CHUNK_HEADER_SIZE.
-        // TODO(perf): This is mainly to avoid copying a lot of body data into our buffer just to
-        //   copy it again when it is read. But maybe the copy would be cheaper than overhead of
-        //   extra event loop turns?
-        KJ_REQUIRE(bufferEnd - bufferStart <= MAX_CHUNK_HEADER_SIZE, "invalid HTTP chunk size");
-        maxBytes = kj::min(maxBytes, MAX_CHUNK_HEADER_SIZE);
-      }
-
-      readPromise = inner.read(headerBuffer.begin() + bufferEnd, 1, maxBytes);
-    }
-
-    return readPromise.then([this,type,bufferStart,bufferEnd](size_t amount) mutable
-                            -> kj::Promise<kj::ArrayPtr<char>> {
       if (lineBreakBeforeNextHeader) {
         // Hackily deal with expected leading line break.
         if (bufferEnd == bufferStart && headerBuffer[bufferEnd] == '\r') {
@@ -1621,7 +1602,7 @@ private:
         }
 
         if (amount == 0) {
-          return readHeader(type, bufferStart, bufferEnd);
+          continue;
         }
       }
 
@@ -1634,7 +1615,8 @@ private:
             memchr(headerBuffer.begin() + pos, '\n', newEnd - pos));
         if (nl == nullptr) {
           // No newline found. Wait for more data.
-          return readHeader(type, bufferStart, newEnd);
+          bufferEnd = newEnd;
+          break;
         }
 
         // Is this newline which we found the last of the header? For a chunk header, always. For
@@ -1642,7 +1624,7 @@ private:
         // "\n" as a newline sequence (though the standard requires "\r\n").
         if (type == HeaderType::CHUNK ||
             (nl - headerBuffer.begin() >= 4 &&
-             ((nl[-1] == '\r' && nl[-2] == '\n') || (nl[-1] == '\n')))) {
+              ((nl[-1] == '\r' && nl[-2] == '\n') || (nl[-1] == '\n')))) {
           // OK, we've got all the data!
 
           size_t endIndex = nl + 1 - headerBuffer.begin();
@@ -1666,12 +1648,14 @@ private:
 
           auto result = headerBuffer.slice(bufferStart, endIndex);
           leftover = headerBuffer.slice(leftoverStart, newEnd);
-          return result;
+          co_return result;
         } else {
           pos = nl - headerBuffer.begin() + 1;
         }
       }
-    });
+
+      // If we're here, we broke out of the inner loop because we need to read more data.
+    }
   }
 
   void snarfBufferedLineBreak() {
@@ -1768,15 +1752,13 @@ public:
       : HttpEntityBodyReader(inner) {}
 
   Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
-    if (alreadyDone()) return constPromise<size_t, 0>();
+    if (alreadyDone()) co_return co_await constPromise<size_t, 0>();
 
-    return getInner().tryRead(buffer, minBytes, maxBytes)
-        .then([=](size_t amount) {
-      if (amount < minBytes) {
-        doneReading();
-      }
-      return amount;
-    });
+    auto amount = co_await getInner().tryRead(buffer, minBytes, maxBytes);
+    if (amount < minBytes) {
+      doneReading();
+    }
+    co_return amount;
   }
 };
 
@@ -1805,15 +1787,16 @@ private:
 
   Promise<size_t> tryReadInternal(void* buffer, size_t minBytes, size_t maxBytes,
                                   size_t alreadyRead) {
-    if (length == 0) {
-      clean = true;
-      return constPromise<size_t, 0>();
-    }
+    for (;;) {
+      if (length == 0) {
+        clean = true;
+        co_return co_await constPromise<size_t, 0>();
+      }
 
-    // We have to set minBytes to 1 here so that if we read any data at all, we update our
-    // counter immediately, so that we still know where we are in case of cancellation.
-    return getInner().tryRead(buffer, 1, kj::min(maxBytes, length))
-        .then([=](size_t amount) -> kj::Promise<size_t> {
+      // We have to set minBytes to 1 here so that if we read any data at all, we update our
+      // counter immediately, so that we still know where we are in case of cancellation.
+      auto amount = co_await getInner().tryRead(buffer, 1, kj::min(maxBytes, length));
+
       length -= amount;
       if (length > 0) {
         // We haven't reached the end of the entity body yet.
@@ -1823,15 +1806,18 @@ private:
         } else if (amount < minBytes) {
           // We requested a minimum 1 byte above, but our own caller actually set a larger minimum
           // which has not yet been reached. Keep trying until we reach it.
-          return tryReadInternal(reinterpret_cast<byte*>(buffer) + amount,
-                                 minBytes - amount, maxBytes - amount, alreadyRead + amount);
+          buffer = reinterpret_cast<byte*>(buffer) + amount;
+          minBytes = minBytes - amount;
+          maxBytes = maxBytes - amount;
+          alreadyRead = alreadyRead + amount;
+          continue;
         }
       } else if (length == 0) {
         doneReading();
       }
       clean = true;
-      return amount + alreadyRead;
-    });
+      co_return amount + alreadyRead;
+    }
   }
 };
 
@@ -1854,37 +1840,40 @@ private:
 
   Promise<size_t> tryReadInternal(void* buffer, size_t minBytes, size_t maxBytes,
                                   size_t alreadyRead) {
-    if (alreadyDone()) {
-      clean = true;
-      return alreadyRead;
-    } else if (chunkSize == 0) {
-      // Read next chunk header.
-      return getInner().readChunkHeader().then([=](uint64_t nextChunkSize) {
+    for (;;) {
+      if (alreadyDone()) {
+        clean = true;
+        co_return alreadyRead;
+      } else if (chunkSize == 0) {
+        // Read next chunk header.
+        auto nextChunkSize = co_await getInner().readChunkHeader();
         if (nextChunkSize == 0) {
           doneReading();
         }
 
         chunkSize = nextChunkSize;
-        return tryReadInternal(buffer, minBytes, maxBytes, alreadyRead);
-      });
-    } else {
-      // Read current chunk.
-      // We have to set minBytes to 1 here so that if we read any data at all, we update our
-      // counter immediately, so that we still know where we are in case of cancellation.
-      return getInner().tryRead(buffer, 1, kj::min(maxBytes, chunkSize))
-          .then([=](size_t amount) -> kj::Promise<size_t> {
+        continue;
+      } else {
+        // Read current chunk.
+        // We have to set minBytes to 1 here so that if we read any data at all, we update our
+        // counter immediately, so that we still know where we are in case of cancellation.
+        auto amount = co_await getInner().tryRead(buffer, 1, kj::min(maxBytes, chunkSize));
+
         chunkSize -= amount;
         if (amount == 0) {
           kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "premature EOF in HTTP chunk"));
         } else if (amount < minBytes) {
           // We requested a minimum 1 byte above, but our own caller actually set a larger minimum
           // which has not yet been reached. Keep trying until we reach it.
-          return tryReadInternal(reinterpret_cast<byte*>(buffer) + amount,
-                                 minBytes - amount, maxBytes - amount, alreadyRead + amount);
+          buffer = reinterpret_cast<byte*>(buffer) + amount;
+          minBytes = minBytes - amount;
+          maxBytes = maxBytes - amount;
+          alreadyRead = alreadyRead + amount;
+          continue;
         }
         clean = true;
-        return alreadyRead + amount;
-      });
+        co_return alreadyRead + amount;
+      }
     }
   }
 };
@@ -2073,49 +2062,46 @@ public:
   }
 
   kj::Promise<void> writeBodyData(const void* buffer, size_t size) {
-    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { return kj::READY_NOW; }
-    KJ_REQUIRE(inBody) { return kj::READY_NOW; }
+    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { co_return; }
+    KJ_REQUIRE(inBody) { co_return; }
 
     writeInProgress = true;
     auto fork = writeQueue.fork();
     writeQueue = fork.addBranch();
 
-    return fork.addBranch().then([this,buffer,size]() {
-      return inner.write(buffer, size);
-    }).then([this]() {
-      writeInProgress = false;
-    });
+    co_await fork.addBranch();
+    co_await inner.write(buffer, size);
+
+    writeInProgress = false;  // TODO(now): Should this be a KJ_DEFER, above?
   }
 
   kj::Promise<void> writeBodyData(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) {
-    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { return kj::READY_NOW; }
-    KJ_REQUIRE(inBody) { return kj::READY_NOW; }
+    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { co_return; }
+    KJ_REQUIRE(inBody) { co_return; }
 
     writeInProgress = true;
     auto fork = writeQueue.fork();
     writeQueue = fork.addBranch();
 
-    return fork.addBranch().then([this,pieces]() {
-      return inner.write(pieces);
-    }).then([this]() {
-      writeInProgress = false;
-    });
+    co_await fork.addBranch();
+    co_await inner.write(pieces);
+
+    writeInProgress = false;  // TODO(now): Should this be a KJ_DEFER, above?
   }
 
   Promise<uint64_t> pumpBodyFrom(AsyncInputStream& input, uint64_t amount) {
-    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { return uint64_t(0); }
-    KJ_REQUIRE(inBody) { return uint64_t(0); }
+    KJ_REQUIRE(!writeInProgress, "concurrent write()s not allowed") { co_return uint64_t(0); }
+    KJ_REQUIRE(inBody) { co_return uint64_t(0); }
 
     writeInProgress = true;
     auto fork = writeQueue.fork();
     writeQueue = fork.addBranch();
 
-    return fork.addBranch().then([this,&input,amount]() {
-      return input.pumpTo(inner, amount);
-    }).then([this](uint64_t actual) {
-      writeInProgress = false;
-      return actual;
-    });
+    co_await fork.addBranch();
+    auto actual = co_await input.pumpTo(inner, amount);
+
+    writeInProgress = false;  // TODO(now): Should this be a KJ_DEFER, above?
+    co_return actual;
   }
 
   void finishBody() {
@@ -2177,10 +2163,14 @@ private:
     // is empty, then they make the write directly, using `writeInProgress` to detect and block
     // concurrent writes.
 
-    writeQueue = writeQueue.then([this,content=kj::mv(content)]() mutable {
-      auto promise = inner.write(content.begin(), content.size());
-      return promise.attach(kj::mv(content));
-    });
+    constexpr auto doWrite = [](Promise<void> writeQueue,
+                                AsyncOutputStream& inner,
+                                String content) -> Promise<void> {
+      co_await writeQueue;
+      co_await inner.write(content.begin(), content.size());
+    };
+
+    writeQueue = doWrite(kj::mv(writeQueue), inner, kj::mv(content));
   }
 };
 
@@ -2282,7 +2272,11 @@ public:
   }
 
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
-    if (amount == 0) return constPromise<uint64_t, 0>();
+    return pumpFrom(input, amount);
+  }
+
+  Promise<uint64_t> pumpFrom(AsyncInputStream& input, uint64_t amount) {
+    if (amount == 0) co_return 0;
 
     bool overshot = amount > length;
     if (overshot) {
@@ -2301,34 +2295,27 @@ public:
     amount = kj::min(amount, length);
     length -= amount;
 
-    auto promise = amount == 0
-        ? kj::Promise<uint64_t>(amount)
-        : getInner().pumpBodyFrom(input, amount).then([this,amount](uint64_t actual) {
-      // Adjust for bytes not written.
-      length += amount - actual;
-      if (length == 0) doneWriting();
-      return actual;
-    });
+    if (amount == 0) co_return 0;
+
+    auto actual = co_await getInner().pumpBodyFrom(input, amount);
+    // Adjust for bytes not written.
+    length += amount - actual;
+    if (length == 0) doneWriting();
 
     if (overshot) {
-      promise = promise.then([amount,&input](uint64_t actual) -> kj::Promise<uint64_t> {
-        if (actual == amount) {
-          // We read exactly the amount expected. In order to detect an overshoot, we have to
-          // try reading one more byte. Ugh.
-          static byte junk;
-          return input.tryRead(&junk, 1, 1).then([actual](size_t extra) {
-            KJ_REQUIRE(extra == 0, "overwrote Content-Length");
-            return actual;
-          });
-        } else {
-          // We actually read less data than requested so we couldn't have overshot. In fact, we
-          // undershot.
-          return actual;
-        }
-      });
+      if (actual == amount) {
+        // We read exactly the amount expected. In order to detect an overshoot, we have to
+        // try reading one more byte. Ugh.
+        static byte junk;
+        auto extra = co_await input.tryRead(&junk, 1, 1);
+        KJ_REQUIRE(extra == 0, "overwrote Content-Length");
+      } else {
+        // We actually read less data than requested so we couldn't have overshot. In fact, we
+        // undershot.
+      }
     }
 
-    return kj::mv(promise);
+    co_return actual;
   }
 
   Promise<void> whenWriteDisconnected() override {
@@ -2339,10 +2326,13 @@ private:
   uint64_t length;
 
   kj::Promise<void> maybeFinishAfter(kj::Promise<void> promise) {
-    if (length == 0) {
-      return promise.then([this]() { doneWriting(); });
-    } else {
-      return kj::mv(promise);
+    // `length` shouldn't be mutated while we await `promise` ... but just in case, let's save it.
+    auto originalLength = length;
+
+    co_await promise;
+
+    if (originalLength == 0) {
+      doneWriting();
     }
   }
 };
@@ -2362,7 +2352,7 @@ public:
   }
 
   Promise<void> write(const void* buffer, size_t size) override {
-    if (size == 0) return kj::READY_NOW;  // can't encode zero-size chunk since it indicates EOF.
+    if (size == 0) co_return;  // can't encode zero-size chunk since it indicates EOF.
 
     auto header = kj::str(kj::hex(size), "\r\n");
     auto parts = kj::heapArray<ArrayPtr<const byte>>(3);
@@ -2370,15 +2360,14 @@ public:
     parts[1] = kj::arrayPtr(reinterpret_cast<const byte*>(buffer), size);
     parts[2] = kj::StringPtr("\r\n").asBytes();
 
-    auto promise = getInner().writeBodyData(parts.asPtr());
-    return promise.attach(kj::mv(header), kj::mv(parts));
+    co_await getInner().writeBodyData(parts.asPtr());
   }
 
   Promise<void> write(ArrayPtr<const ArrayPtr<const byte>> pieces) override {
     uint64_t size = 0;
     for (auto& piece: pieces) size += piece.size();
 
-    if (size == 0) return kj::READY_NOW;  // can't encode zero-size chunk since it indicates EOF.
+    if (size == 0) co_return;  // can't encode zero-size chunk since it indicates EOF.
 
     auto header = kj::str(kj::hex(size), "\r\n");
     auto partsBuilder = kj::heapArrayBuilder<ArrayPtr<const byte>>(pieces.size() + 2);
@@ -2389,35 +2378,33 @@ public:
     partsBuilder.add(kj::StringPtr("\r\n").asBytes());
 
     auto parts = partsBuilder.finish();
-    auto promise = getInner().writeBodyData(parts.asPtr());
-    return promise.attach(kj::mv(header), kj::mv(parts));
+    co_await getInner().writeBodyData(parts.asPtr());
   }
 
   Maybe<Promise<uint64_t>> tryPumpFrom(AsyncInputStream& input, uint64_t amount) override {
     KJ_IF_MAYBE(l, input.tryGetLength()) {
       // Hey, we know exactly how large the input is, so we can write just one chunk.
-
-      uint64_t length = kj::min(amount, *l);
-      auto& inner = getInner();
-      inner.writeBodyData(kj::str(kj::hex(length), "\r\n"));
-      return inner.pumpBodyFrom(input, length)
-          .then([this,length](uint64_t actual) {
-        auto& inner = getInner();
-        if (actual < length) {
-          inner.abortBody();
-          KJ_FAIL_REQUIRE(
-              "value returned by input.tryGetLength() was greater than actual bytes transferred") {
-            break;
-          }
-        }
-
-        inner.writeBodyData(kj::str("\r\n"));
-        return actual;
-      });
+      return pumpFrom(input, kj::min(amount, *l));
     } else {
       // Need to use naive read/write loop.
       return nullptr;
     }
+  }
+
+  Promise<uint64_t> pumpFrom(AsyncInputStream& input, uint64_t length) {
+    getInner().writeBodyData(kj::str(kj::hex(length), "\r\n"));
+
+    auto actual = co_await getInner().pumpBodyFrom(input, length);
+    if (actual < length) {
+      getInner().abortBody();
+      KJ_FAIL_REQUIRE(
+          "value returned by input.tryGetLength() was greater than actual bytes transferred") {
+        break;
+      }
+    }
+
+    getInner().writeBodyData(kj::str("\r\n"));
+    co_return actual;
   }
 
   Promise<void> whenWriteDisconnected() override {
@@ -2473,28 +2460,25 @@ public:
       memcpy(payload.begin() + 2, reason.begin(), reason.size());
     }
 
-    auto promise = sendImpl(OPCODE_CLOSE, payload);
-    return promise.attach(kj::mv(payload));
+    co_await sendImpl(OPCODE_CLOSE, payload);
   }
 
   kj::Promise<void> disconnect() override {
     KJ_REQUIRE(!currentlySending, "another message send is already in progress");
 
-    KJ_IF_MAYBE(p, sendingPong) {
+    while (sendingPong != nullptr) {
+      // TODO(now): This was a loop, but perhaps intended as a one-off check?
       // We recently sent a pong, make sure it's finished before proceeding.
-      currentlySending = true;
-      auto promise = p->then([this]() {
-        currentlySending = false;
-        return disconnect();
-      });
+      auto promise = kj::mv(KJ_ASSERT_NONNULL(sendingPong));
       sendingPong = nullptr;
-      return promise;
+      currentlySending = true;
+      co_await promise;
+      currentlySending = false;  // TODO(now): Should be KJ_DEFER?
     }
 
     disconnected = true;
 
     stream->shutdownWrite();
-    return kj::READY_NOW;
   }
 
   void abort() override {
@@ -2510,139 +2494,152 @@ public:
   }
 
   kj::Promise<Message> receive(size_t maxSize) override {
-    size_t headerSize = Header::headerSize(recvData.begin(), recvData.size());
+    for (;;) {
+      size_t headerSize = Header::headerSize(recvData.begin(), recvData.size());
 
-    if (headerSize > recvData.size()) {
-      if (recvData.begin() != recvBuffer.begin()) {
-        // Move existing data to front of buffer.
-        if (recvData.size() > 0) {
-          memmove(recvBuffer.begin(), recvData.begin(), recvData.size());
+      if (headerSize > recvData.size()) {
+        if (recvData.begin() != recvBuffer.begin()) {
+          // Move existing data to front of buffer.
+          if (recvData.size() > 0) {
+            memmove(recvBuffer.begin(), recvData.begin(), recvData.size());
+          }
+          recvData = recvBuffer.slice(0, recvData.size());
         }
-        recvData = recvBuffer.slice(0, recvData.size());
-      }
 
-      return stream->tryRead(recvData.end(), 1, recvBuffer.end() - recvData.end())
-          .then([this,maxSize](size_t actual) -> kj::Promise<Message> {
+        auto actual = co_await stream->tryRead(recvData.end(), 1, recvBuffer.end() - recvData.end());
         receivedBytes += actual;
         if (actual == 0) {
           if (recvData.size() > 0) {
-            return KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in frame header");
+            kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in frame header"));
           } else {
             // It's incorrect for the WebSocket to disconnect without sending `Close`.
-            return KJ_EXCEPTION(DISCONNECTED,
-                "WebSocket disconnected between frames without sending `Close`.");
+            kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED,
+                "WebSocket disconnected between frames without sending `Close`."));
           }
         }
 
         recvData = recvBuffer.slice(0, recvData.size() + actual);
-        return receive(maxSize);
-      });
-    }
-
-    auto& recvHeader = *reinterpret_cast<Header*>(recvData.begin());
-    if (recvHeader.hasRsv2or3()) {
-      return errorHandler.handleWebSocketProtocolError({
-        1002, "Received frame had RSV bits 2 or 3 set",
-      });
-    }
-
-    recvData = recvData.slice(headerSize, recvData.size());
-
-    size_t payloadLen = recvHeader.getPayloadLen();
-    if (payloadLen > maxSize) {
-      return errorHandler.handleWebSocketProtocolError({
-        1009, kj::str("Message is too large: ", payloadLen, " > ", maxSize)
-      });
-    }
-
-    auto opcode = recvHeader.getOpcode();
-    bool isData = opcode < OPCODE_FIRST_CONTROL;
-    if (opcode == OPCODE_CONTINUATION) {
-      if (fragments.empty()) {
-        return errorHandler.handleWebSocketProtocolError({
-          1002, "Unexpected continuation frame"
-        });
+        continue;
       }
 
-      opcode = fragmentOpcode;
-    } else if (isData) {
-      if (!fragments.empty()) {
-        return errorHandler.handleWebSocketProtocolError({
-          1002, "Missing continuation frame"
-        });
-      }
-    }
-
-    bool isFin = recvHeader.isFin();
-
-    kj::Array<byte> message;           // space to allocate
-    byte* payloadTarget;               // location into which to read payload (size is payloadLen)
-    kj::Maybe<size_t> originalMaxSize; // maxSize from first `receive()` call
-    if (isFin) {
-      size_t amountToAllocate;
-      if (recvHeader.isCompressed() || fragmentCompressed) {
-        // Add 4 since we append 0x00 0x00 0xFF 0xFF to the tail of the payload.
-        // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
-        amountToAllocate = payloadLen + 4;
-      } else {
-        // Add space for NUL terminator when allocating text message.
-        amountToAllocate = payloadLen + (opcode == OPCODE_TEXT && isFin);
+      auto& recvHeader = *reinterpret_cast<Header*>(recvData.begin());
+      if (recvHeader.hasRsv2or3()) {
+        kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
+          1002, "Received frame had RSV bits 2 or 3 set",
+        }));
       }
 
-      if (isData && !fragments.empty()) {
-        // Final frame of a fragmented message. Gather the fragments.
-        size_t offset = 0;
-        for (auto& fragment: fragments) offset += fragment.size();
-        message = kj::heapArray<byte>(offset + amountToAllocate);
-        originalMaxSize = offset + maxSize; // gives us back the original maximum message size.
+      recvData = recvData.slice(headerSize, recvData.size());
 
-        offset = 0;
-        for (auto& fragment: fragments) {
-          memcpy(message.begin() + offset, fragment.begin(), fragment.size());
-          offset += fragment.size();
+      size_t payloadLen = recvHeader.getPayloadLen();
+      if (payloadLen > maxSize) {
+        kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
+          1009, kj::str("Message is too large: ", payloadLen, " > ", maxSize)
+        }));
+      }
+
+      auto opcode = recvHeader.getOpcode();
+      bool isData = opcode < OPCODE_FIRST_CONTROL;
+      if (opcode == OPCODE_CONTINUATION) {
+        if (fragments.empty()) {
+          kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
+            1002, "Unexpected continuation frame"
+          }));
         }
-        payloadTarget = message.begin() + offset;
 
-        fragments.clear();
-        fragmentOpcode = 0;
-        fragmentCompressed = false;
+        opcode = fragmentOpcode;
+      } else if (isData) {
+        if (!fragments.empty()) {
+          kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
+            1002, "Missing continuation frame"
+          }));
+        }
+      }
+
+      bool isFin = recvHeader.isFin();
+
+      kj::Array<byte> message;           // space to allocate
+      byte* payloadTarget;               // location into which to read payload (size is payloadLen)
+      kj::Maybe<size_t> originalMaxSize; // maxSize from first `receive()` call
+      if (isFin) {
+        size_t amountToAllocate;
+        if (recvHeader.isCompressed() || fragmentCompressed) {
+          // Add 4 since we append 0x00 0x00 0xFF 0xFF to the tail of the payload.
+          // See: https://datatracker.ietf.org/doc/html/rfc7692#section-7.2.2
+          amountToAllocate = payloadLen + 4;
+        } else {
+          // Add space for NUL terminator when allocating text message.
+          amountToAllocate = payloadLen + (opcode == OPCODE_TEXT && isFin);
+        }
+
+        if (isData && !fragments.empty()) {
+          // Final frame of a fragmented message. Gather the fragments.
+          size_t offset = 0;
+          for (auto& fragment: fragments) offset += fragment.size();
+          message = kj::heapArray<byte>(offset + amountToAllocate);
+          originalMaxSize = offset + maxSize; // gives us back the original maximum message size.
+
+          offset = 0;
+          for (auto& fragment: fragments) {
+            memcpy(message.begin() + offset, fragment.begin(), fragment.size());
+            offset += fragment.size();
+          }
+          payloadTarget = message.begin() + offset;
+
+          fragments.clear();
+          fragmentOpcode = 0;
+          fragmentCompressed = false;
+        } else {
+          // Single-frame message.
+          message = kj::heapArray<byte>(amountToAllocate);
+          originalMaxSize = maxSize; // gives us back the original maximum message size.
+          payloadTarget = message.begin();
+        }
       } else {
-        // Single-frame message.
-        message = kj::heapArray<byte>(amountToAllocate);
-        originalMaxSize = maxSize; // gives us back the original maximum message size.
+        // Fragmented message, and this isn't the final fragment.
+        if (!isData) {
+          kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
+            1002, "Received fragmented control frame"
+          }));
+        }
+
+        message = kj::heapArray<byte>(payloadLen);
         payloadTarget = message.begin();
-      }
-    } else {
-      // Fragmented message, and this isn't the final fragment.
-      if (!isData) {
-        return errorHandler.handleWebSocketProtocolError({
-          1002, "Received fragmented control frame"
-        });
+        if (fragments.empty()) {
+          // This is the first fragment, so set the opcode.
+          fragmentOpcode = opcode;
+          fragmentCompressed = recvHeader.isCompressed();
+        }
       }
 
-      message = kj::heapArray<byte>(payloadLen);
-      payloadTarget = message.begin();
-      if (fragments.empty()) {
-        // This is the first fragment, so set the opcode.
-        fragmentOpcode = opcode;
-        fragmentCompressed = recvHeader.isCompressed();
+      Mask mask = recvHeader.getMask();
+
+      if (payloadLen <= recvData.size()) {
+        // All data already received.
+        memcpy(payloadTarget, recvData.begin(), payloadLen);
+        recvData = recvData.slice(payloadLen, recvData.size());
+      } else {
+        // Need to read more data.
+        auto size = recvData.size();
+        memcpy(payloadTarget, recvData.begin(), size);
+        recvData = nullptr;
+        size_t remaining = payloadLen - size;
+        auto amount = co_await stream->tryRead(payloadTarget + size, remaining, remaining);
+        receivedBytes += amount;
+        if (amount < remaining) {
+          kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in message"));
+        }
       }
-    }
 
-    Mask mask = recvHeader.getMask();
-
-    auto handleMessage =
-        [this,opcode,payloadTarget,payloadLen,mask,isFin,maxSize,originalMaxSize,message=kj::mv(message)]() mutable
-        -> kj::Promise<Message> {
       if (!mask.isZero()) {
         mask.apply(kj::arrayPtr(payloadTarget, payloadLen));
       }
 
       if (!isFin) {
         // Add fragment to the list and loop.
-        auto newMax = maxSize - message.size();
+        maxSize = maxSize - message.size();
         fragments.add(kj::mv(message));
-        return receive(newMax);
+        continue;
       }
 
       switch (opcode) {
@@ -2650,7 +2647,7 @@ public:
           // Shouldn't get here; handled above.
           KJ_UNREACHABLE;
         case OPCODE_TEXT:
-#if KJ_HAS_ZLIB
+  #if KJ_HAS_ZLIB
           KJ_IF_MAYBE(config, compressionConfig) {
             auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
             auto tail = message.slice(message.size() - 4, message.size());
@@ -2668,13 +2665,13 @@ public:
             // We want to add the null terminator when receiving a TEXT message.
             auto decompressed = decompressor.processMessage(message, originalMaxSize,
                 addNullTerminator);
-            return Message(kj::String(decompressed.releaseAsChars()));
+            co_return Message(kj::String(decompressed.releaseAsChars()));
           }
-#endif // KJ_HAS_ZLIB
+  #endif // KJ_HAS_ZLIB
           message.back() = '\0';
-          return Message(kj::String(message.releaseAsChars()));
+          co_return Message(kj::String(message.releaseAsChars()));
         case OPCODE_BINARY:
-#if KJ_HAS_ZLIB
+  #if KJ_HAS_ZLIB
           KJ_IF_MAYBE(config, compressionConfig) {
             auto& decompressor = KJ_ASSERT_NONNULL(decompressionContext);
             auto tail = message.slice(message.size() - 4, message.size());
@@ -2689,52 +2686,32 @@ public:
               decompressor.reset();
             }
             auto decompressed = decompressor.processMessage(message, originalMaxSize);
-            return Message(decompressed.releaseAsBytes());
+            co_return Message(decompressed.releaseAsBytes());
           }
-#endif // KJ_HAS_ZLIB
-          return Message(message.releaseAsBytes());
+  #endif // KJ_HAS_ZLIB
+          co_return Message(message.releaseAsBytes());
         case OPCODE_CLOSE:
           if (message.size() < 2) {
-            return Message(Close { 1005, nullptr });
+            co_return Message(Close { 1005, nullptr });
           } else {
             uint16_t status = (static_cast<uint16_t>(message[0]) << 8)
                             | (static_cast<uint16_t>(message[1])     );
-            return Message(Close {
+            co_return Message(Close {
               status, kj::heapString(message.slice(2, message.size()).asChars())
             });
           }
         case OPCODE_PING:
           // Send back a pong.
           queuePong(kj::mv(message));
-          return receive(maxSize);
+          continue;
         case OPCODE_PONG:
           // Unsolicited pong. Ignore.
-          return receive(maxSize);
+          continue;
         default:
-          return errorHandler.handleWebSocketProtocolError({
+          kj::throwFatalException(errorHandler.handleWebSocketProtocolError({
             1002, kj::str("Unknown opcode ", opcode)
-          });
+          }));
       }
-    };
-
-    if (payloadLen <= recvData.size()) {
-      // All data already received.
-      memcpy(payloadTarget, recvData.begin(), payloadLen);
-      recvData = recvData.slice(payloadLen, recvData.size());
-      return handleMessage();
-    } else {
-      // Need to read more data.
-      memcpy(payloadTarget, recvData.begin(), recvData.size());
-      size_t remaining = payloadLen - recvData.size();
-      auto promise = stream->tryRead(payloadTarget + recvData.size(), remaining, remaining)
-          .then([this, remaining](size_t amount) {
-        receivedBytes += amount;
-        if (amount < remaining) {
-          kj::throwRecoverableException(KJ_EXCEPTION(DISCONNECTED, "WebSocket EOF in message"));
-        }
-      });
-      recvData = nullptr;
-      return promise.then(kj::mv(handleMessage));
     }
   }
 
