@@ -2719,52 +2719,55 @@ public:
     KJ_IF_MAYBE(optOther, kj::dynamicDowncastIfAvailable<WebSocketImpl>(other)) {
       // Both WebSockets are raw WebSockets, so we can pump the streams directly rather than read
       // whole messages.
-
-      if ((maskKeyGenerator == nullptr) == (optOther->maskKeyGenerator == nullptr)) {
-        // Oops, it appears that we either believe we are the client side of both sockets, or we
-        // are the server side of both sockets. Since clients must "mask" their outgoing frames but
-        // servers must *not* do so, we can't direct-pump. Sad.
-        return nullptr;
-      }
-
-      KJ_IF_MAYBE(config, compressionConfig) {
-        KJ_IF_MAYBE(otherConfig, optOther->compressionConfig) {
-          if (config->outboundMaxWindowBits != otherConfig->inboundMaxWindowBits ||
-              config->inboundMaxWindowBits != otherConfig->outboundMaxWindowBits ||
-              config->inboundNoContextTakeover!= otherConfig->outboundNoContextTakeover ||
-              config->outboundNoContextTakeover!= otherConfig->inboundNoContextTakeover) {
-            // Compression configurations differ.
-            return nullptr;
-          }
-        } else {
-          // Only one websocket uses compression.
-          return nullptr;
-        }
-      } else {
-        if (optOther->compressionConfig != nullptr) {
-          // Only one websocket uses compression.
-          return nullptr;
-        }
-      }
-      // Both websockets use compatible compression configurations so we can pump directly.
-
-      // Check same error conditions as with sendImpl().
-      KJ_REQUIRE(!disconnected, "WebSocket can't send after disconnect()");
-      KJ_REQUIRE(!currentlySending, "another message send is already in progress");
-      currentlySending = true;
-
-      // If the application chooses to pump messages out, but receives incoming messages normally
-      // with `receive()`, then we will receive pings and attempt to send pongs. But we can't
-      // safely insert a pong in the middle of a pumped stream. We kind of don't have a choice
-      // except to drop them on the floor, which is what will happen if we set `hasSentClose` true.
-      // Hopefully most apps that set up a pump do so in both directions at once, and so pings will
-      // flow through and pongs will flow back.
-      hasSentClose = true;
-
-      return optOther->optimizedPumpTo(*this);
+      return pumpFrom(*optOther);
     }
 
     return nullptr;
+  }
+
+  Promise<void> pumpFrom(WebSocketImpl& optOther) {
+    if ((maskKeyGenerator == nullptr) == (optOther.maskKeyGenerator == nullptr)) {
+      // Oops, it appears that we either believe we are the client side of both sockets, or we
+      // are the server side of both sockets. Since clients must "mask" their outgoing frames but
+      // servers must *not* do so, we can't direct-pump. Sad.
+      return nullptr;
+    }
+
+    KJ_IF_MAYBE(config, compressionConfig) {
+      KJ_IF_MAYBE(otherConfig, optOther.compressionConfig) {
+        if (config->outboundMaxWindowBits != otherConfig->inboundMaxWindowBits ||
+            config->inboundMaxWindowBits != otherConfig->outboundMaxWindowBits ||
+            config->inboundNoContextTakeover!= otherConfig->outboundNoContextTakeover ||
+            config->outboundNoContextTakeover!= otherConfig->inboundNoContextTakeover) {
+          // Compression configurations differ.
+          return nullptr;
+        }
+      } else {
+        // Only one websocket uses compression.
+        return nullptr;
+      }
+    } else {
+      if (optOther.compressionConfig != nullptr) {
+        // Only one websocket uses compression.
+        return nullptr;
+      }
+    }
+    // Both websockets use compatible compression configurations so we can pump directly.
+
+    // Check same error conditions as with sendImpl().
+    KJ_REQUIRE(!disconnected, "WebSocket can't send after disconnect()");
+    KJ_REQUIRE(!currentlySending, "another message send is already in progress");
+    currentlySending = true;
+
+    // If the application chooses to pump messages out, but receives incoming messages normally
+    // with `receive()`, then we will receive pings and attempt to send pongs. But we can't
+    // safely insert a pong in the middle of a pumped stream. We kind of don't have a choice
+    // except to drop them on the floor, which is what will happen if we set `hasSentClose` true.
+    // Hopefully most apps that set up a pump do so in both directions at once, and so pings will
+    // flow through and pongs will flow back.
+    hasSentClose = true;
+
+    return optOther.optimizedPumpTo(*this);
   }
 
   uint64_t sentByteCount() override { return sentBytes; }
@@ -3241,14 +3244,12 @@ private:
 
     currentlySending = true;
 
-    KJ_IF_MAYBE(p, sendingPong) {
+    while (sendingPong != nullptr) {
+      // TODO(now): This was a loop, but perhaps intended as a one-off check?
       // We recently sent a pong, make sure it's finished before proceeding.
-      auto promise = p->then([this, opcode, message]() {
-        currentlySending = false;
-        return sendImpl(opcode, message);
-      });
+      auto promise = kj::mv(KJ_ASSERT_NONNULL(sendingPong));
       sendingPong = nullptr;
-      return promise;
+      co_await promise;
     }
 
     // We don't stop the application from sending further messages after close() -- this is the
@@ -3299,21 +3300,18 @@ private:
     KJ_ASSERT(!sendHeader.hasRsv2or3(), "RSV bits 2 and 3 must be 0, as we do not currently "
         "support an extension that would set these bits");
 
-    auto promise = stream->write(sendParts).attach(kj::mv(compressedMessage));
-    if (!mask.isZero()) {
-      promise = promise.attach(kj::mv(ownMessage));
-    }
-    return promise.then([this, size = sendParts[0].size() + sendParts[1].size()]() {
-      currentlySending = false;
+    auto size = sendParts[0].size() + sendParts[1].size();
 
-      // Send queued pong if needed.
-      KJ_IF_MAYBE(q, queuedPong) {
-        kj::Array<byte> payload = kj::mv(*q);
-        queuedPong = nullptr;
-        queuePong(kj::mv(payload));
-      }
-      sentBytes += size;
-    });
+    co_await stream->write(sendParts);
+    currentlySending = false;
+
+    // Send queued pong if needed.
+    KJ_IF_MAYBE(q, queuedPong) {
+      kj::Array<byte> payload = kj::mv(*q);
+      queuedPong = nullptr;
+      queuePong(kj::mv(payload));
+    }
+    sentBytes += size;
   }
 
   void queuePong(kj::Array<byte> payload) {
@@ -3324,71 +3322,83 @@ private:
       //   previous one, it can opt to respond only to the last ping. So we don't have to check if
       //   queuedPong is already non-null.
       queuedPong = kj::mv(payload);
-    } else KJ_IF_MAYBE(promise, sendingPong) {
-      // We're still sending a previous pong. Wait for it to finish before sending ours.
-      sendingPong = promise->then([this,payload=kj::mv(payload)]() mutable {
-        return sendPong(kj::mv(payload));
-      });
     } else {
-      // We're not sending any pong currently.
-      sendingPong = sendPong(kj::mv(payload));
+      sendingPong = sendPong(kj::mv(sendingPong), kj::mv(payload));
     }
   }
 
-  kj::Promise<void> sendPong(kj::Array<byte> payload) {
+  kj::Promise<void> sendPong(kj::Maybe<kj::Promise<void>> maybeWaitFor, kj::Array<byte> payload) {
+    KJ_IF_MAYBE(promise, maybeWaitFor) {
+      // We're still sending a previous pong. Wait for it to finish before sending ours.
+      co_await *promise;
+    } else {
+      // We're not sending any pong currently.
+    }
+
     if (hasSentClose || disconnected) {
-      return kj::READY_NOW;
+      co_return;
     }
 
     sendParts[0] = sendHeader.compose(true, false, OPCODE_PONG,
                                       payload.size(), Mask(maskKeyGenerator));
     sendParts[1] = payload;
-    return stream->write(sendParts).attach(kj::mv(payload));
+    co_await stream->write(sendParts);
   }
 
   kj::Promise<void> optimizedPumpTo(WebSocketImpl& other) {
-    KJ_IF_MAYBE(p, other.sendingPong) {
-      // We recently sent a pong, make sure it's finished before proceeding.
-      auto promise = p->then([this, &other]() {
-        return optimizedPumpTo(other);
-      });
-      other.sendingPong = nullptr;
-      return promise;
-    }
+    for (;;) {
+      // TODO(now): This was a loop, but perhaps intended as a sequence of two one-off checks?
 
-    if (recvData.size() > 0) {
-      // We have some data buffered. Write it first.
-      return other.stream->write(recvData.begin(), recvData.size())
-          .then([this, &other, size = recvData.size()]() {
+      KJ_IF_MAYBE(p, other.sendingPong) {
+        // We recently sent a pong, make sure it's finished before proceeding.
+        auto promise = kj::mv(*p);
+        other.sendingPong = nullptr;
+        co_await promise;
+        continue;
+      }
+
+      auto size = recvData.size();
+      if (size > 0) {
+        // We have some data buffered. Write it first.
+        co_await other.stream->write(recvData.begin(), size);
         recvData = nullptr;
         other.sentBytes += size;
-        return optimizedPumpTo(other);
-      });
+        continue;
+      }
+
+      break;
     }
 
-    auto cancelPromise = other.stream->whenWriteDisconnected()
-        .then([this]() -> kj::Promise<void> {
-      this->abort();
-      return KJ_EXCEPTION(DISCONNECTED,
-          "destination of WebSocket pump disconnected prematurely");
-    });
-
     // There's no buffered incoming data, so start pumping stream now.
-    return stream->pumpTo(*other.stream).then([this, &other](size_t s) -> kj::Promise<void> {
-      // WebSocket pumps are expected to include end-of-stream.
-      other.disconnected = true;
-      other.stream->shutdownWrite();
-      receivedBytes += s;
-      other.sentBytes += s;
-      return kj::READY_NOW;
-    }, [&other](kj::Exception&& e) -> kj::Promise<void> {
-      // We don't know if it was a read or a write that threw. If it was a read that threw, we need
-      // to send a disconnect on the destination. If it was the destination that threw, it
-      // shouldn't hurt to disconnect() it again, but we'll catch and squelch any exceptions.
-      other.disconnected = true;
-      kj::runCatchingExceptions([&other]() { other.stream->shutdownWrite(); });
-      return kj::mv(e);
-    }).exclusiveJoin(kj::mv(cancelPromise));
+
+    constexpr auto onDisconnect =
+        [](WebSocketImpl& self, WebSocketImpl& other) -> kj::Promise<void> {
+      co_await other.stream->whenWriteDisconnected();
+      self.abort();
+      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED,
+          "destination of WebSocket pump disconnected prematurely"));
+    };
+
+    constexpr auto doPump = [](WebSocketImpl& self, WebSocketImpl& other) -> kj::Promise<void> {
+      try {
+        auto s = co_await self.stream->pumpTo(*other.stream);
+        // WebSocket pumps are expected to include end-of-stream.
+        other.disconnected = true;
+        other.stream->shutdownWrite();
+        self.receivedBytes += s;
+        other.sentBytes += s;
+      } catch (Exception& e) {
+        // We don't know if it was a read or a write that threw. If it was a read that threw, we
+        // need to send a disconnect on the destination. If it was the destination that threw, it
+        // shouldn't hurt to disconnect() it again, but we'll catch and squelch any exceptions.
+        other.disconnected = true;
+        kj::runCatchingExceptions([&other]() { other.stream->shutdownWrite(); });
+        kj::throwFatalException(kj::mv(e));
+      }
+    };
+
+    co_await doPump(*this, other)
+        .exclusiveJoin(onDisconnect(*this, other));
   }
 };
 
