@@ -2173,8 +2173,22 @@ class CoroutineMixin;
 // CRTP mixin, covered later.
 
 template <typename T>
+class CoroutineController: public Event {
+public:
+  void exclusiveJoin(Promise<T> promise) {
+    // Get the promise node from `promise`, call `node->onReady(this)`.
+    // Implement `fire()`, which fulfills the coroutien if it's still waiting.
+  }
+};
+
+class ThisCoroutine {};
+// A magic type, whose objects, when `co_await`ed within a coroutine definition, result in a
+// `CoroutineController<T>&`.
+
+template <typename T>
 class Coroutine final: public CoroutineBase,
-                       public CoroutineMixin<Coroutine<T>, T> {
+                       public CoroutineMixin<Coroutine<T>, T>,
+                       public CoroutineController<T> {
   // The standard calls this the `promise_type` object. We can call this the "coroutine
   // implementation object" since the word promise means different things in KJ and std styles. This
   // is where we implement how a `kj::Promise<T>` is returned from a coroutine, and how that promise
@@ -2224,6 +2238,22 @@ public:
   // coroutine's PromiseNode. An `operator co_await()` free function would have to implement
   // a type-erased `await_suspend(stdcoro::coroutine_handle<void>)` override, and implement
   // suspension and resumption in terms of .then(). Yuck!
+
+  auto await_transform(const ThisCoroutine&) {
+    // Called when someone writes `co_await kj::CO_THIS`. Returns an awaitable which is immediately
+    // ready with a controller reference.
+
+    struct ImmediateController {
+
+      CoroutineController<T>& controller;
+
+      bool await_ready() const { return true; }
+      CoroutineController<T>& await_resume() { return controller; }
+      bool await_suspend(Coroutine::Handle coroutine) { KJ_UNREACHABLE; }
+    };
+
+    return ImmediateController(*this);
+  }
 
 private:
   // -------------------------------------------------------
@@ -2337,5 +2367,11 @@ private:
 #undef KJ_COROUTINE_STD_NAMESPACE
 
 }  // namespace kj::_ (private)
+
+namespace kj {
+
+constexpr _::ThisCoroutine CO_THIS;
+
+}  // namespace kj
 
 KJ_END_HEADER

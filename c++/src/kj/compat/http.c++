@@ -3533,50 +3533,46 @@ public:
 
   kj::Promise<void> send(kj::ArrayPtr<const byte> message) override {
     KJ_IF_MAYBE(s, state) {
-      return s->send(message).then([&, size = message.size()]() { transferredBytes += size; });
+      co_await s->send(message);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message))
-          .then([&, size = message.size()]() { transferredBytes += size; });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message));
     }
+    transferredBytes += message.size();
   }
   kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
     KJ_IF_MAYBE(s, state) {
-      return s->send(message).then([&, size = message.size()]() { transferredBytes += size; });
+      co_await s->send(message);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message))
-          .then([&, size = message.size()]() { transferredBytes += size; });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(message));
     }
+    transferredBytes += message.size();
   }
   kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
     KJ_IF_MAYBE(s, state) {
-      return s->close(code, reason)
-          .then([&, size = reason.size()]() { transferredBytes += (2 +size); });
+      co_await s->close(code, reason);
     } else {
-      return newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(ClosePtr { code, reason }))
-          .then([&, size = reason.size()]() { transferredBytes += (2 +size); });
+      co_await newAdaptedPromise<void, BlockedSend>(*this, MessagePtr(ClosePtr { code, reason }));
     }
+    transferredBytes += (2 + reason.size());
   }
   kj::Promise<void> disconnect() override {
     KJ_IF_MAYBE(s, state) {
-      return s->disconnect();
+      co_await s->disconnect();
     } else {
       ownState = heap<Disconnected>();
       state = *ownState;
-      return kj::READY_NOW;
     }
   }
   kj::Promise<void> whenAborted() override {
     if (aborted) {
-      return kj::READY_NOW;
+      co_return;
     } else KJ_IF_MAYBE(p, abortedPromise) {
-      return p->addBranch();
+      co_await p->addBranch();
     } else {
       auto paf = newPromiseAndFulfiller<void>();
       abortedFulfiller = kj::mv(paf.fulfiller);
-      auto fork = paf.promise.fork();
-      auto result = fork.addBranch();
-      abortedPromise = kj::mv(fork);
-      return result;
+      auto& fork = abortedPromise.emplace(paf.promise.fork());
+      co_await fork.addBranch();
     }
   }
   kj::Maybe<kj::Promise<void>> tryPumpFrom(WebSocket& other) override {
@@ -3595,18 +3591,22 @@ public:
     }
   }
   kj::Promise<void> pumpTo(WebSocket& other) override {
-    auto onAbort = other.whenAborted()
-        .then([]() -> kj::Promise<void> {
-      return KJ_EXCEPTION(DISCONNECTED, "WebSocket was aborted");
-    });
+    constexpr auto onAbort = [](WebSocket& other) -> kj::Promise<void> {
+      co_await other.whenAborted();
+      kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "WebSocket was aborted"));
+    };
+
+    auto cancelPromise = onAbort(other);
 
     KJ_IF_MAYBE(s, state) {
       auto before = other.receivedByteCount();
+      // TODO(now): Not sure how best to clean this up.
       return s->pumpTo(other).attach(kj::defer([this, &other, before]() {
         transferredBytes += other.receivedByteCount() - before;
-      })).exclusiveJoin(kj::mv(onAbort));
+      })).exclusiveJoin(kj::mv(cancelPromise));
     } else {
-      return newAdaptedPromise<void, BlockedPumpTo>(*this, other).exclusiveJoin(kj::mv(onAbort));
+      return newAdaptedPromise<void, BlockedPumpTo>(*this, other)
+          .exclusiveJoin(kj::mv(cancelPromise));
     }
   }
 
