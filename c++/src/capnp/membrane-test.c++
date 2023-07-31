@@ -119,7 +119,7 @@ public:
   }
 
   kj::Own<MembranePolicy> addRef() override {
-    return kj::addRef(*this);
+    return addRefToThis();
   }
 
   kj::Maybe<kj::Promise<void>> onRevoked() override {

@@ -22,6 +22,7 @@
 #include "async.h"
 #include "debug.h"
 #include <kj/compat/gtest.h>
+#include "kj/refcount.h"
 #include "mutex.h"
 #include "thread.h"
 
@@ -548,17 +549,17 @@ TEST(Async, Fork) {
   EXPECT_EQ(789, branch2.wait(waitScope));
 }
 
-struct RefcountedInt: public Refcounted {
+struct RefcountedInt: public Refcounted, public kj::EnableSharedFromThis<RefcountedInt> {
   RefcountedInt(int i): i(i) {}
   int i;
-  Own<RefcountedInt> addRef() { return kj::addRef(*this); }
+  Own<RefcountedInt> addRef() { return addRefToThis(); }
 };
 
 TEST(Async, ForkRef) {
   EventLoop loop;
   WaitScope waitScope(loop);
 
-  Promise<Own<RefcountedInt>> promise = evalLater([&]() {
+  Promise<Own<RefcountedInt>> promise = evalLater([&]() -> Own<RefcountedInt> {
     return refcounted<RefcountedInt>(123);
   });
 

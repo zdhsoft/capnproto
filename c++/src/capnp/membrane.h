@@ -100,7 +100,7 @@ public:
   // Return a new owned pointer to the same policy.
   //
   // Typically an implementation of MembranePolicy should also inherit kj::Refcounted and implement
-  // `addRef()` as `return kj::addRef(*this);`.
+  // `addRef()` as `return addRefToThis();`.
   //
   // Note that the membraning system considers two membranes created with the same MembranePolicy
   // object actually to be the *same* membrane. This is relevant when an object passes into the
